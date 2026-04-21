@@ -6,6 +6,11 @@ function Dashboard({ setIsAuthenticated }) {
   const [faces, setFaces] = useState([]);
   const [selectedFaceId, setSelectedFaceId] = useState(null);
   const [isSwapping, setIsSwapping] = useState(false);
+  const [engineStatus, setEngineStatus] = useState({
+    mode: "mock",
+    available: true,
+    message: "Mock mode active",
+  });
   const [settings, setSettings] = useState({
     execution_provider: "cpu",
     frame_processor: "face_swapper",
@@ -13,13 +18,7 @@ function Dashboard({ setIsAuthenticated }) {
   });
   const [uploading, setUploading] = useState(false);
 
-  useEffect(() => {
-    loadFaces();
-    loadSettings();
-    checkSwapStatus();
-  }, []);
-
-  const loadFaces = async () => {
+  async function loadFaces() {
     try {
       const response = await api.get("/faces");
       setFaces(response.data);
@@ -28,25 +27,36 @@ function Dashboard({ setIsAuthenticated }) {
     } catch (error) {
       console.error("Failed to load faces:", error);
     }
-  };
+  }
 
-  const loadSettings = async () => {
+  async function loadSettings() {
     try {
       const response = await api.get("/auth/settings");
       setSettings(response.data);
     } catch (error) {
       console.error("Failed to load settings:", error);
     }
-  };
+  }
 
-  const checkSwapStatus = async () => {
+  async function checkSwapStatus() {
     try {
       const response = await api.get("/swap/status");
       setIsSwapping(response.data.isRunning);
+      if (response.data.engine) {
+        setEngineStatus(response.data.engine);
+      }
     } catch (error) {
       console.error("Failed to check swap status:", error);
     }
-  };
+  }
+
+  useEffect(() => {
+    queueMicrotask(() => {
+      loadFaces();
+      loadSettings();
+      checkSwapStatus();
+    });
+  }, []);
 
   const handleImageUpload = async (event) => {
     const file = event.target.files[0];
@@ -76,8 +86,13 @@ function Dashboard({ setIsAuthenticated }) {
       return;
     }
     try {
-      await api.post("/swap/start", { faceImageId: selectedFaceId });
+      const response = await api.post("/swap/start", {
+        faceImageId: selectedFaceId,
+      });
       setIsSwapping(true);
+      if (response.data.engine) {
+        setEngineStatus(response.data.engine);
+      }
       alert(
         "Face swap started! Open your video app and select OBS Virtual Camera.",
       );
@@ -91,8 +106,11 @@ function Dashboard({ setIsAuthenticated }) {
 
   const stopSwap = async () => {
     try {
-      await api.post("/swap/stop");
+      const response = await api.post("/swap/stop");
       setIsSwapping(false);
+      if (response.data.engine) {
+        setEngineStatus(response.data.engine);
+      }
       alert("Face swap stopped.");
     } catch (error) {
       alert(
@@ -163,6 +181,10 @@ function Dashboard({ setIsAuthenticated }) {
             ></div>
             <span>Status: {isSwapping ? "SWAPPING ACTIVE" : "IDLE"}</span>
           </div>
+          <p className="engine-status-text">
+            Engine Mode: {engineStatus.mode?.toUpperCase() || "UNKNOWN"} |{" "}
+            {engineStatus.available ? "Connected" : "Unavailable"}
+          </p>
           {!isSwapping ? (
             <button
               onClick={startSwap}
@@ -222,7 +244,7 @@ function Dashboard({ setIsAuthenticated }) {
               try {
                 await api.post("/auth/settings", settings);
                 alert("Settings saved!");
-              } catch (error) {
+              } catch {
                 alert("Failed to save settings");
               }
             }}

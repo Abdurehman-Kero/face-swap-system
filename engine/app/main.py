@@ -74,6 +74,7 @@ class PassthroughPipeline:
         self.fps = fps
         self.live_mirror = live_mirror
         self.virtual_cam_backend = virtual_cam_backend
+        self.active_virtual_cam_backend = "auto"
         self.frame_processor = frame_processor
         self.source_face_path = source_face_path
         self.stop_event = Event()
@@ -91,6 +92,7 @@ class PassthroughPipeline:
         self.detect_every_n = 3
         self.frame_index = 0
         self.last_faces: list[tuple[int, int, int, int]] = []
+        self.smoothed_face_box: tuple[int, int, int, int] | None = None
         self.missed_detections = 0
 
     def start(self) -> None:
@@ -113,7 +115,8 @@ class PassthroughPipeline:
                 "outputFps": round(self.output_fps, 2),
                 "latencyMs": round(self.latency_ms, 2),
                 "droppedFrames": self.dropped_frames,
-                "backend": self.virtual_cam_backend or "auto",
+                "backend": self.active_virtual_cam_backend,
+                "requestedBackend": self.virtual_cam_backend or "auto",
                 "frameProcessor": self.frame_processor,
                 "missedDetections": self.missed_detections,
             }
@@ -161,47 +164,110 @@ class PassthroughPipeline:
         faces = self.last_faces
         if not faces:
             self.missed_detections += 1
-            # Fallback region keeps output visibly transformed even when detector misses.
-            frame_h, frame_w = frame.shape[:2]
-            w = int(frame_w * 0.28)
-            h = int(frame_h * 0.40)
-            x = (frame_w - w) // 2
-            y = int(frame_h * 0.22)
-            faces = [(x, y, w, h)]
+            if self.missed_detections > 8:
+                self.smoothed_face_box = None
+            return frame
         else:
             self.missed_detections = 0
 
-        for x, y, w, h in faces:
-            x = max(0, min(x, frame.shape[1] - 1))
-            y = max(0, min(y, frame.shape[0] - 1))
-            w = max(1, min(w, frame.shape[1] - x))
-            h = max(1, min(h, frame.shape[0] - y))
-            target = cv2.resize(self.source_face, (w, h))
+        x, y, w, h = self._pick_primary_face_box(faces)
+        x, y, w, h = self._smooth_face_box((x, y, w, h))
 
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.ellipse(
-                mask,
-                (w // 2, h // 2),
-                (max(1, int(w * 0.45)), max(1, int(h * 0.48))),
-                0,
-                0,
-                360,
-                255,
-                -1,
+        x = max(0, min(x, frame.shape[1] - 1))
+        y = max(0, min(y, frame.shape[0] - 1))
+        w = max(1, min(w, frame.shape[1] - x))
+        h = max(1, min(h, frame.shape[0] - y))
+
+        roi = frame[y : y + h, x : x + w]
+        if roi.size == 0:
+            return frame
+
+        target = cv2.resize(self.source_face, (w, h), interpolation=cv2.INTER_LINEAR)
+        target = self._match_color(target, roi)
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(
+            mask,
+            (w // 2, h // 2),
+            (max(1, int(w * 0.42)), max(1, int(h * 0.47))),
+            0,
+            0,
+            360,
+            255,
+            -1,
+        )
+        mask = cv2.GaussianBlur(mask, (17, 17), 0)
+
+        center = (x + w // 2, y + h // 2)
+        try:
+            frame = cv2.seamlessClone(target, frame, mask, center, cv2.NORMAL_CLONE)
+        except Exception:
+            alpha = (mask.astype(np.float32) / 255.0)[:, :, None]
+            blended = (target.astype(np.float32) * alpha) + (
+                roi.astype(np.float32) * (1.0 - alpha)
             )
-
-            center = (x + w // 2, y + h // 2)
-            try:
-                frame = cv2.seamlessClone(target, frame, mask, center, cv2.NORMAL_CLONE)
-            except Exception:
-                roi = frame[y : y + h, x : x + w]
-                alpha = (mask.astype(np.float32) / 255.0)[:, :, None]
-                blended = (target.astype(np.float32) * alpha) + (
-                    roi.astype(np.float32) * (1.0 - alpha)
-                )
-                frame[y : y + h, x : x + w] = blended.astype(np.uint8)
+            frame[y : y + h, x : x + w] = blended.astype(np.uint8)
 
         return frame
+
+    def _pick_primary_face_box(
+        self, faces: list[tuple[int, int, int, int]]
+    ) -> tuple[int, int, int, int]:
+        if len(faces) == 1:
+            return faces[0]
+
+        if self.smoothed_face_box is None:
+            return max(faces, key=lambda box: box[2] * box[3])
+
+        px, py, pw, ph = self.smoothed_face_box
+        pcx = px + pw * 0.5
+        pcy = py + ph * 0.5
+
+        def score(box: tuple[int, int, int, int]) -> float:
+            x, y, w, h = box
+            cx = x + w * 0.5
+            cy = y + h * 0.5
+            distance = ((cx - pcx) ** 2 + (cy - pcy) ** 2) ** 0.5
+            area = w * h
+            return area - (distance * 8.0)
+
+        return max(faces, key=score)
+
+    def _smooth_face_box(
+        self, box: tuple[int, int, int, int]
+    ) -> tuple[int, int, int, int]:
+        if self.smoothed_face_box is None:
+            self.smoothed_face_box = box
+            return box
+
+        alpha = 0.68
+        sx, sy, sw, sh = self.smoothed_face_box
+        x, y, w, h = box
+
+        smoothed = (
+            int(sx * alpha + x * (1.0 - alpha)),
+            int(sy * alpha + y * (1.0 - alpha)),
+            int(sw * alpha + w * (1.0 - alpha)),
+            int(sh * alpha + h * (1.0 - alpha)),
+        )
+        self.smoothed_face_box = smoothed
+        return smoothed
+
+    def _match_color(self, source: Any, target_roi: Any) -> Any:
+        source_f = source.astype(np.float32)
+        target_f = target_roi.astype(np.float32)
+
+        src_mean = source_f.mean(axis=(0, 1), keepdims=True)
+        src_std = source_f.std(axis=(0, 1), keepdims=True)
+        dst_mean = target_f.mean(axis=(0, 1), keepdims=True)
+        dst_std = target_f.std(axis=(0, 1), keepdims=True)
+
+        # Keep transfer bounded to avoid aggressive color shifts.
+        ratio = dst_std / (src_std + 1e-5)
+        ratio = np.clip(ratio, 0.7, 1.4)
+
+        normalized = (source_f - src_mean) * ratio + dst_mean
+        return np.clip(normalized, 0, 255).astype(np.uint8)
 
     def _run(self) -> None:
         if cv2 is None or pyvirtualcam is None:
@@ -248,17 +314,49 @@ class PassthroughPipeline:
         output_counter = 0
         window_start = time.perf_counter()
 
-        try:
-            camera_kwargs: dict[str, Any] = {
-                "width": self.width,
-                "height": self.height,
-                "fps": self.fps,
-                "fmt": pyvirtualcam.PixelFormat.BGR,
-            }
-            if self.virtual_cam_backend:
-                camera_kwargs["backend"] = self.virtual_cam_backend
+        camera_kwargs_base: dict[str, Any] = {
+            "width": self.width,
+            "height": self.height,
+            "fps": self.fps,
+            "fmt": pyvirtualcam.PixelFormat.BGR,
+        }
 
-            with pyvirtualcam.Camera(**camera_kwargs) as cam:
+        requested = self.virtual_cam_backend or None
+        backends_to_try: list[str | None] = [requested]
+        if requested == "obs":
+            backends_to_try.extend(["unitycapture", None])
+        elif requested == "unitycapture":
+            backends_to_try.append(None)
+
+        # De-duplicate while preserving order.
+        deduped_backends: list[str | None] = []
+        for backend in backends_to_try:
+            if backend not in deduped_backends:
+                deduped_backends.append(backend)
+
+        cam = None
+        open_errors: list[str] = []
+        for backend in deduped_backends:
+            try:
+                camera_kwargs = dict(camera_kwargs_base)
+                if backend is not None:
+                    camera_kwargs["backend"] = backend
+                cam = pyvirtualcam.Camera(**camera_kwargs)
+                self.active_virtual_cam_backend = backend or "auto"
+                break
+            except Exception as exc:
+                label = backend or "auto"
+                open_errors.append(f"{label}: {exc}")
+
+        if cam is None:
+            with self.metrics_lock:
+                self.last_error = " ; ".join(open_errors)
+                self.running = False
+            cap.release()
+            return
+
+        try:
+            with cam:
                 with self.metrics_lock:
                     self.virtual_camera = cam.device
 

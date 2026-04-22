@@ -76,8 +76,63 @@ const uploadFace = async (req, res, next) => {
   }
 };
 
+const deleteFace = async (req, res, next) => {
+  let connection;
+  try {
+    const faceId = Number(req.params.id);
+    if (!Number.isInteger(faceId) || faceId <= 0) {
+      return res.status(400).json({ error: "Invalid face id" });
+    }
+
+    connection = await promisePool.getConnection();
+    await connection.beginTransaction();
+
+    const [rows] = await connection.query(
+      `SELECT id, image_path
+         FROM face_images
+         WHERE id = ? AND user_id = ?
+         LIMIT 1`,
+      [faceId, req.user.id],
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({ error: "Face image not found" });
+    }
+
+    await connection.query(
+      "DELETE FROM swap_sessions WHERE user_id = ? AND face_image_id = ?",
+      [req.user.id, faceId],
+    );
+
+    await connection.query(
+      "DELETE FROM face_images WHERE id = ? AND user_id = ?",
+      [faceId, req.user.id],
+    );
+
+    await connection.commit();
+
+    const filePath = path.resolve(__dirname, "../../", rows[0].image_path);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+
+    return res.json({ success: true, id: faceId });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+    return next(error);
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+};
+
 module.exports = {
   upload,
   listFaces,
   uploadFace,
+  deleteFace,
 };

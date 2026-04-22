@@ -43,6 +43,8 @@ const status = async (req, res, next) => {
       if (!isRunning) {
         await stopSessionRecord(active.sessionId);
         activeByUser.delete(req.user.id);
+      } else {
+        active.outputCameraName = remoteStatus.pipeline?.virtualCamera || null;
       }
     }
 
@@ -52,6 +54,7 @@ const status = async (req, res, next) => {
         isRunning: true,
         sessionId: latest.sessionId,
         faceImageId: latest.faceImageId,
+        outputCameraName: latest.outputCameraName || null,
         engine,
       });
     }
@@ -60,6 +63,7 @@ const status = async (req, res, next) => {
       isRunning: false,
       sessionId: null,
       faceImageId: null,
+      outputCameraName: null,
       engine,
     });
   } catch (error) {
@@ -114,8 +118,9 @@ const start = async (req, res, next) => {
       faces[0].image_path,
     );
 
+    let outputCameraName = null;
     if (swapEngineClient.isEngineMode()) {
-      await swapEngineClient.startSession({
+      const startResult = await swapEngineClient.startSession({
         userId: req.user.id,
         sessionId: result.insertId,
         faceImageId,
@@ -124,11 +129,13 @@ const start = async (req, res, next) => {
         frameProcessor: userSettings.frame_processor,
         liveMirror: Boolean(userSettings.live_mirror),
       });
+      outputCameraName = startResult.pipeline?.virtualCamera || null;
     }
 
     activeByUser.set(req.user.id, {
       sessionId: result.insertId,
       faceImageId,
+      outputCameraName,
     });
 
     const engine = await swapEngineClient.health();
@@ -137,6 +144,7 @@ const start = async (req, res, next) => {
       success: true,
       isRunning: true,
       sessionId: result.insertId,
+      outputCameraName,
       engine,
     });
   } catch (error) {
@@ -150,7 +158,12 @@ const stop = async (req, res, next) => {
     const engine = await swapEngineClient.health();
 
     if (!active) {
-      return res.json({ success: true, isRunning: false, engine });
+      return res.json({
+        success: true,
+        isRunning: false,
+        outputCameraName: null,
+        engine,
+      });
     }
 
     if (swapEngineClient.isEngineMode()) {
@@ -160,7 +173,12 @@ const stop = async (req, res, next) => {
     await stopSessionRecord(active.sessionId);
     activeByUser.delete(req.user.id);
 
-    return res.json({ success: true, isRunning: false, engine });
+    return res.json({
+      success: true,
+      isRunning: false,
+      outputCameraName: null,
+      engine,
+    });
   } catch (error) {
     return next(error);
   }

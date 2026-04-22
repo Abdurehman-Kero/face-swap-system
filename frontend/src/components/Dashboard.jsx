@@ -17,6 +17,9 @@ function Dashboard({ setIsAuthenticated }) {
     live_mirror: false,
   });
   const [uploading, setUploading] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [deletingFaceId, setDeletingFaceId] = useState(null);
+  const [outputCameraName, setOutputCameraName] = useState(null);
 
   async function loadFaces() {
     try {
@@ -42,6 +45,7 @@ function Dashboard({ setIsAuthenticated }) {
     try {
       const response = await api.get("/swap/status");
       setIsSwapping(response.data.isRunning);
+      setOutputCameraName(response.data.outputCameraName || null);
       if (response.data.engine) {
         setEngineStatus(response.data.engine);
       }
@@ -80,6 +84,30 @@ function Dashboard({ setIsAuthenticated }) {
     }
   };
 
+  const handleDeleteFace = async (faceId) => {
+    const face = faces.find((item) => item.id === faceId);
+    const confirmed = window.confirm(
+      `Delete ${face?.original_filename || "this image"}?`,
+    );
+    if (!confirmed) return;
+
+    setDeletingFaceId(faceId);
+    try {
+      await api.delete(`/faces/${faceId}`);
+      if (selectedFaceId === faceId) {
+        setSelectedFaceId(null);
+      }
+      await loadFaces();
+    } catch (error) {
+      alert(
+        "Failed to delete image: " +
+          (error.response?.data?.error || "Unknown error"),
+      );
+    } finally {
+      setDeletingFaceId(null);
+    }
+  };
+
   const startSwap = async () => {
     if (!selectedFaceId) {
       alert("Please select a face image first");
@@ -90,11 +118,13 @@ function Dashboard({ setIsAuthenticated }) {
         faceImageId: selectedFaceId,
       });
       setIsSwapping(true);
+      setOutputCameraName(response.data.outputCameraName || null);
       if (response.data.engine) {
         setEngineStatus(response.data.engine);
       }
+      const cameraHint = response.data.outputCameraName || "OBS Virtual Camera";
       alert(
-        "Face swap started! Open your video app and select OBS Virtual Camera.",
+        `Face swap started! In OBS, add a Video Capture Device and pick: ${cameraHint}`,
       );
     } catch (error) {
       alert(
@@ -108,6 +138,7 @@ function Dashboard({ setIsAuthenticated }) {
     try {
       const response = await api.post("/swap/stop");
       setIsSwapping(false);
+      setOutputCameraName(null);
       if (response.data.engine) {
         setEngineStatus(response.data.engine);
       }
@@ -128,31 +159,36 @@ function Dashboard({ setIsAuthenticated }) {
   return (
     <div className="dashboard">
       <header className="dashboard-header">
-        <h1>Face Swap System</h1>
+        <div>
+          <p className="dashboard-subtitle">Live Avatar Studio</p>
+          <h1>Face Swap System</h1>
+        </div>
         <button onClick={logout} className="logout-btn">
           Logout
         </button>
       </header>
 
       <div className="dashboard-grid">
-        {/* Left Panel - Face Images */}
-        <div className="panel faces-panel">
-          <h2>Your Faces</h2>
-          <div className="upload-area">
-            <input
-              type="file"
-              id="face-upload"
-              accept="image/*"
-              onChange={handleImageUpload}
-              style={{ display: "none" }}
-            />
-            <label htmlFor="face-upload" className="upload-btn">
-              {uploading ? "Uploading..." : "+ Upload New Face"}
-            </label>
+        <div className="panel panel-wide faces-panel">
+          <div className="panel-head">
+            <h2>Face Library</h2>
+            <div className="upload-area">
+              <input
+                type="file"
+                id="face-upload"
+                accept="image/*"
+                onChange={handleImageUpload}
+                style={{ display: "none" }}
+              />
+              <label htmlFor="face-upload" className="upload-btn">
+                {uploading ? "Uploading..." : "Upload Face"}
+              </label>
+            </div>
           </div>
+
           <div className="faces-grid">
             {faces.map((face) => (
-              <div
+              <article
                 key={face.id}
                 className={`face-card ${selectedFaceId === face.id ? "selected" : ""}`}
                 onClick={() => setSelectedFaceId(face.id)}
@@ -161,20 +197,35 @@ function Dashboard({ setIsAuthenticated }) {
                   src={buildAssetUrl(face.image_path)}
                   alt={face.original_filename}
                 />
-                <span>{face.original_filename}</span>
-              </div>
+                <div className="face-meta">
+                  <span title={face.original_filename}>
+                    {face.original_filename}
+                  </span>
+                  <button
+                    type="button"
+                    className="delete-face-btn"
+                    disabled={deletingFaceId === face.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleDeleteFace(face.id);
+                    }}
+                  >
+                    {deletingFaceId === face.id ? "Deleting..." : "Delete"}
+                  </button>
+                </div>
+              </article>
             ))}
-            {faces.length === 0 && (
-              <p className="no-faces">
-                No faces uploaded yet. Upload your first face image!
-              </p>
-            )}
           </div>
+
+          {faces.length === 0 && (
+            <p className="no-faces">
+              No faces uploaded yet. Upload your first face image to begin.
+            </p>
+          )}
         </div>
 
-        {/* Center Panel - Controls */}
         <div className="panel controls-panel">
-          <h2>Control Panel</h2>
+          <h2>Session Control</h2>
           <div className="status-indicator">
             <div
               className={`status-led ${isSwapping ? "active" : "inactive"}`}
@@ -185,6 +236,17 @@ function Dashboard({ setIsAuthenticated }) {
             Engine Mode: {engineStatus.mode?.toUpperCase() || "UNKNOWN"} |{" "}
             {engineStatus.available ? "Connected" : "Unavailable"}
           </p>
+          <div className="obs-preview-card">
+            <p className="obs-preview-title">OBS Preview Source</p>
+            <p className="obs-preview-name">
+              {outputCameraName || "Start swap to detect output camera"}
+            </p>
+            <p className="obs-preview-help">
+              {
+                "In OBS: Sources -> + -> Video Capture Device -> Device -> choose the source above."
+              }
+            </p>
+          </div>
           {!isSwapping ? (
             <button
               onClick={startSwap}
@@ -199,21 +261,26 @@ function Dashboard({ setIsAuthenticated }) {
             </button>
           )}
           <div className="instructions">
-            <h3>How to Use:</h3>
+            <h3>Quick Steps</h3>
             <ol>
               <li>Upload a clear front-facing photo</li>
               <li>Select the face you want to use</li>
               <li>Click "Start Face Swap"</li>
+              <li>
+                Open OBS and select the detected preview source shown above
+              </li>
               <li>Open WhatsApp, Telegram, or Zoom</li>
-              <li>Select "OBS Virtual Camera" as your camera</li>
+              <li>
+                Select OBS Virtual Camera (or your selected virtual source) as
+                camera
+              </li>
               <li>Your face is now swapped!</li>
             </ol>
           </div>
         </div>
 
-        {/* Right Panel - Settings */}
         <div className="panel settings-panel">
-          <h2>Performance Settings</h2>
+          <h2>Performance</h2>
           <div className="setting-group">
             <label>Execution Provider:</label>
             <select
@@ -241,16 +308,20 @@ function Dashboard({ setIsAuthenticated }) {
           </div>
           <button
             onClick={async () => {
+              setSavingSettings(true);
               try {
                 await api.post("/auth/settings", settings);
                 alert("Settings saved!");
               } catch {
                 alert("Failed to save settings");
+              } finally {
+                setSavingSettings(false);
               }
             }}
             className="save-btn"
+            disabled={savingSettings}
           >
-            Save Settings
+            {savingSettings ? "Saving..." : "Save Settings"}
           </button>
         </div>
       </div>
